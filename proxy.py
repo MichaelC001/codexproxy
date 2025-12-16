@@ -72,6 +72,9 @@ def codex_reader(proc: subprocess.Popen) -> None:
             message = extract_text_from_codex_event(obj)
         except json.JSONDecodeError:
             message = line
+            print(f"[proxy] non-json line: {line}", flush=True)
+        else:
+            print(f"[proxy] codex event: {json.dumps(obj, ensure_ascii=False)}", flush=True)
         if message:
             message_queue.put(message)
     message_queue.put("Codex process exited. Restart the proxy to continue.")
