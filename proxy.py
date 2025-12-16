@@ -12,7 +12,6 @@ Optional environment variables:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import queue
@@ -22,13 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, ApplicationBuilder, ContextTypes, JobQueue, MessageHandler, filters
 
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -126,47 +119,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     stdin.flush()
 
 
-async def codex_queue_worker(application: Application) -> None:
-    """Background task: forward codex messages to Telegram."""
-    loop = asyncio.get_running_loop()
+async def pump_codex_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send buffered codex messages to Telegram."""
+    global active_chat_id
+    if active_chat_id is None:
+        return
     while True:
         try:
-            message = await loop.run_in_executor(None, message_queue.get)
-        except asyncio.CancelledError:
+            message = message_queue.get_nowait()
+        except queue.Empty:
             break
         if message is None:
-            break
-        chat_id = active_chat_id
-        if chat_id is None:
-            continue
+            return
         try:
-            await application.bot.send_message(chat_id=chat_id, text=message)
-        except Exception as exc:
-            # Log to stderr and continue.
+            await context.bot.send_message(chat_id=active_chat_id, text=message)
+        except Exception as exc:  # pragma: no cover - log and continue
             print(f"[proxy] failed to send message: {exc}", flush=True)
 
 
-async def main() -> None:
+def main() -> None:
     proc = start_codex_process()
     reader_thread = threading.Thread(target=codex_reader, args=(proc,), daemon=True)
     reader_thread.start()
 
-    application: Application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    job_queue = JobQueue()
+    application: Application = ApplicationBuilder().token(TELEGRAM_TOKEN).job_queue(job_queue).build()
     application.bot_data["codex_proc"] = proc
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    worker_task = asyncio.create_task(codex_queue_worker(application))
+    application.job_queue.run_repeating(pump_codex_queue, interval=1.0, first=1.0)
 
     try:
-        await application.run_polling()
+        application.run_polling()
     finally:
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
-
         if proc.poll() is None:
             proc.terminate()
             try:
@@ -176,4 +161,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
